@@ -1,0 +1,402 @@
+---
+title: "Stat_1361_Final_Project_Code"
+author: "Thomas DeMarco"
+date: "2024-04-15"
+output: html_document
+---
+
+```{r}
+#read in dataset and remove album name and track name for ease of analysis 
+set.seed(123)
+library(caret)
+songs <- read.csv("train.csv")
+#View(songs)
+train_index <- createDataPartition(songs$id, p = 0.8, list = FALSE)
+train_data <- songs[train_index, ]
+train_data <- train_data[, !(names(train_data) %in% c("album_name", "track_name", "id"))]
+test_data <- songs[-train_index, ]
+test_data <- test_data[, !(names(test_data) %in% c("album_name", "track_name", "id"))]
+
+#handling categorical variables
+train_data$explicit <- as.numeric(train_data$explicit == "TRUE")
+test_data$explicit <- as.numeric(test_data$explicit == "TRUE")
+
+# Convert "track_genre" variable to numeric
+train_data$track_genre <- as.factor(train_data$track_genre)
+test_data$track_genre <- as.factor(test_data$track_genre)
+
+head(train_data)
+head(test_data)
+```
+
+```{r}
+# Fit linear regression model
+set.seed(123)
+lm_model <- lm(popularity ~ ., data = train_data)
+lm_predicted <- predict(lm_model, newdata = test_data)
+lm_mse <- mean((test_data$popularity - lm_predicted)^2)
+
+# Fit ridge regression model with cross-validation
+library(glmnet)
+set.seed(123)
+mm <- model.matrix(popularity ~ ., data = train_data)
+ridge_model <- cv.glmnet(mm, train_data$popularity, alpha = 1, nfolds = 10)
+ridge_predicted <- predict(ridge_model, newx = model.matrix(popularity ~ ., data = test_data), s = ridge_model$lambda.min)
+ridge_mse <- mean((test_data$popularity - ridge_predicted)^2)
+
+# Fit lasso regression model with cross-validation
+set.seed(123)
+lasso_model <- cv.glmnet(mm, train_data$popularity, alpha = 1, nfolds = 10)
+bestLambda <- lasso_model$lambda.min
+lasso_model <- glmnet(mm, train_data$popularity, alpha = 1, lambda = bestLambda)
+lasso_predicted <- predict(lasso_model, newx = model.matrix(popularity ~ ., data = test_data))
+lasso_mse <- mean((test_data$popularity - lasso_predicted)^2)
+```
+
+```{r}
+#Use Best Subset regression methods:
+library(leaps)
+set.seed(123)
+model <- regsubsets(popularity ~ ., data = train_data, nvmax = 15, method = "forward")
+plot(summary(model)$cp)
+
+
+# helper function to predict from a regsubsets model
+set.seed(123)
+predict.regsubsets <- function(object, newdata, id, ...) {
+  form <- as.formula(object$call[[2]])
+  mat <- model.matrix(form, newdata)
+  coefi <- coef(object, id = id)
+  xvars <- names(coefi)
+  mat[, xvars] %*% coefi
+}
+
+set.seed(123)
+err <- sapply(1:15, function(i) {
+  x <- coef(model, id = i)
+  mean((test_data$popularity - predict(model, test_data, i))^2)
+})
+which.min(err)
+
+best_model <- which.min(summary(model)$cp)
+coef_nonzero <- coef(model, id = best_model)
+coef_nonzero
+
+# Identify non-zero coefficients
+nonzero_indices <- which(coef_nonzero != 0)
+nonzero_variables <- names(nonzero_indices)
+nonzero_variables
+```
+
+```{r}
+#GAM Model
+library(gam)
+set.seed(123)
+modelGam <- gam(popularity ~ s(duration_ms,2) +s(danceability,2) +s(energy,2)  +s(valence,2) + s(tempo,2) +s(time_signature,2), data = train_data)
+
+pred <- predict(modelGam, test_data)
+err_gam <- mean((test_data$popularity - pred)^2)
+
+summary(modelGam)
+#energy and tempo have an exponential relationship with popularity
+```
+
+```{r}
+#Tree Model
+library(tree)
+set.seed(123)
+tree <- tree(popularity ~ ., data = train_data)
+summary(tree)
+plot(tree)
+text(tree, pretty = 0, digits = 2, cex = 0.8)
+
+mse <- function(model) {
+  p <- predict(model, newdata = test_data)
+  mean((p - test_data$popularity)^2)
+}
+treeErr <- mse(tree)
+
+#Use cross-validation in order to determine the optimal level of tree complexity, and prune that tree
+set.seed(123)
+res <- cv.tree(tree)
+plot(res$size, res$dev, type = "b", xlab = "Tree size", ylab = "Deviance")
+min <- which.min(res$dev)
+abline(v = res$size[min], lty = 2, col = "red")
+
+ptr <- prune.tree(tree, best = 11)
+plot(ptr)
+text(ptr, pretty = 0, digits = 2, cex = 0.8)
+pruneTreeErr <- mse(ptr)
+```
+
+```{r}
+#boosting with lamda tuned
+library(gbm)
+set.seed(123)
+lambdas <- 10 ^ seq(-3, 0, by = 0.1)
+models <- lapply(lambdas, function(lam) {
+  gbm(popularity ~ ., data = train_data, distribution = "gaussian", 
+      n.trees = 1000, shrinkage = lam)
+})
+
+errs <- sapply(models, function(model) {
+  p <- predict(model, test_data, n.trees = 1000)
+  mean((p - test_data$popularity)^2)
+})
+
+plot(lambdas, errs, type = "b", xlab = "Shrinkage values", 
+     ylab = "Training MSE", log = "xy")
+
+errs <- sapply(models, function(model) {
+  p <- predict(model, test_data, n.trees = 1000)
+  mean((p - test_data$popularity)^2)
+})
+
+plot(lambdas, errs, type = "b", xlab = "Shrinkage values", 
+     ylab = "Test MSE", log = "xy")
+min(errs)
+abline(v = lambdas[which.min(errs)], lty = 2, col = "red")
+
+#Boosting error
+boostedError<-min(errs)
+
+#Most important variables
+summary(models[[which.min(errs)]])
+```
+
+```{r}
+#Random Forests/Bagging
+
+library(randomForest)
+# Random Forest
+rf_model <- randomForest(popularity ~ ., data = train_data, mtry = 3, ntree = 100)
+
+# Bagging
+bag_model <- randomForest(popularity ~ ., data = train_data, mtry = ncol(train_data) - 1, ntree = 100)
+
+# Predict popularity ratings using test data
+rf_pred <- predict(rf_model, newdata = test_data)
+bag_pred <- predict(bag_model, newdata = test_data)
+
+# Calculate test errors
+rf_error <- mean((test_data$popularity - rf_pred)^2)
+bag_error <- mean((test_data$popularity - bag_pred)^2)
+
+```
+
+```{r}
+#optimize best models: bagged and random forest
+
+#Optimizing bagged forest:
+
+set.seed(123)
+library(ggplot2)
+
+# Define range of ntree values to try
+ntree_values <- seq(100, 1000, by = 100)  # Try values from 100 to 1000 in steps of 100
+
+# Initialize vector to store errors
+errors <- numeric(length(ntree_values))
+
+# Loop through each value of ntree
+set.seed(123)
+for (i in seq_along(ntree_values)) {
+  # Fit bagged forest model with current ntree value
+  bag_model <- randomForest(popularity ~ ., data = train_data, ntree = ntree_values[i])
+  
+  # Predict popularity ratings using test data
+  bag_pred <- predict(bag_model, newdata = test_data)
+  
+  # Calculate test error
+  errors[i] <- mean((test_data$popularity - bag_pred)^2)
+}
+
+# Create a data frame to store ntree and error values
+df <- data.frame(ntree = ntree_values, error = errors)
+
+# Plot the errors
+ggplot(df, aes(x = ntree, y = error)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Number of Trees (ntree)", y = "Test MSE", title = "Test MSE vs. Number of Trees")
+
+bestErrorBag <- min(errors)
+bestErrorBag
+
+set.seed(123)
+
+#Random forest:
+library(randomForest)
+
+# Define a range of mtry values to try
+mtry_values <- seq(1, ncol(train_data) - 1, by = 1)  # Try all possible values from 1 to total predictors
+
+# Initialize a vector to store the errors for each mtry value
+errors <- numeric(length(mtry_values))
+
+# Loop through each mtry value
+set.seed(123)
+for (i in seq_along(mtry_values)) {
+  # Fit random forest model with current mtry value
+  rf_model <- randomForest(popularity ~ ., data = train_data, mtry = mtry_values[i], ntree = 500)
+  
+  # Predict popularity ratings using test data
+  rf_pred <- predict(rf_model, newdata = test_data)
+  
+  # Calculate test error
+  errors[i] <- mean((test_data$popularity - rf_pred)^2)
+}
+
+# Find the mtry value that minimizes the error
+optimal_mtry <- mtry_values[which.min(errors)]
+optimal_error <- min(errors)
+
+# Plot the errors for different mtry values
+plot(mtry_values, errors, type = "l", xlab = "mtry", ylab = "Test MSE")
+
+optimal_error
+
+#Now Optimizing by changing both mtry and nTrees simultaneously
+set.seed(123)
+library(randomForest)
+
+# Define ranges of mtry and ntree values to try
+mtry_values <- seq(1, ncol(train_data) - 1, by = 1)  # Try all possible values from 1 to total predictors
+ntree_values <- seq(100, 1000, by = 100)  # Try values from 100 to 1000 in steps of 100
+
+# Initialize variables to store optimal parameters and error
+optimal_error <- Inf
+optimal_mtry <- NULL
+optimal_ntree <- NULL
+
+# Loop through each combination of mtry and ntree values
+set.seed(123)
+for (mtry in mtry_values) {
+  for (ntree in ntree_values) {
+    # Fit random forest model with current mtry and ntree values
+    rf_model <- randomForest(popularity ~ ., data = train_data, mtry = mtry, ntree = ntree)
+    
+    # Predict popularity ratings using test data
+    rf_pred <- predict(rf_model, newdata = test_data)
+    
+    # Calculate test error
+    error <- mean((test_data$popularity - rf_pred)^2)
+    
+    # Update optimal parameters if error is lower
+    if (error < optimal_error) {
+      optimal_error <- error
+      optimal_mtry <- mtry
+      optimal_ntree <- ntree
+    }
+  }
+}
+
+# Output the optimal parameters and error
+optimal_error_rf <- optimal_error
+optimal_mtry
+optimal_ntree
+```
+
+```{r}
+#Use variable importance measures:
+
+# Function to select numeric variables from a dataset
+select_numeric_vars <- function(data) {
+  numeric_vars <- sapply(data, is.numeric)  # Identify numeric variables
+  numeric_data <- data[, numeric_vars]  # Subset only numeric variables
+  return(numeric_data)
+}
+
+songs_numeric <- select_numeric_vars(songs)
+cor(songs_numeric)
+
+# Assess variable importance using permutation testing
+importance(rf_model)
+
+#Test if there are exponential relationships
+summary(modelGam)
+
+#Most important variables
+summary(models[[which.min(errs)]])
+
+#Investigation of genre
+
+# Subset data for each genre
+jazz_songs <- subset(songs, track_genre == "jazz")
+pop_songs <- subset(songs, track_genre == "pop")
+rock_songs <- subset(songs, track_genre == "rock")
+
+# Calculate mean popularity for each genre
+jazz_mean_popularity <- mean(jazz_songs$popularity)
+pop_mean_popularity <- mean(pop_songs$popularity)
+rock_mean_popularity <- mean(rock_songs$popularity)
+
+# Create a data frame to display the results
+genre_popularity_means <- data.frame(
+  Genre = c("Jazz", "Pop", "Rock"),
+  Average_Popularity = c(jazz_mean_popularity, pop_mean_popularity, rock_mean_popularity)
+)
+
+# View the results
+print(genre_popularity_means)
+
+```
+
+```{r}
+#Print all error values
+lm_mse
+ridge_mse
+lasso_mse
+err_gam
+treeErr
+pruneTreeErr
+boostedError
+bag_error
+rf_error
+bestErrorBag
+optimal_error_rf
+```
+
+```{r}
+# Create a bar plot for MSE comparison:
+
+# Create a vector of MSE values
+mse_values <- c(lm_mse, ridge_mse, lasso_mse, err_gam, treeErr,pruneTreeErr,boostedError ,bag_error, rf_error,bestErrorBag,optimal_error_rf)
+
+# Define names for the models
+model_names <- c("Linear Regression", "Ridge Regression", "Lasso Regression", "GAM", "Tree", "Pruned Tree Error","Boosting","Bagged Forest","Random Forest", "Optimized Bagged Forest","Optimized Random Forest")
+
+# Create a bar plot
+barplot(mse_values, names.arg = model_names, xlab = "Models", ylab = "MSE", col = "skyblue", main = "Mean Squared Error (MSE) Comparison")
+
+```
+
+```{r}
+#Generate Test Predictions
+set.seed(123)
+library(randomForest)
+finalData <- read.csv("test.csv")
+id <- finalData$id
+finalData <- finalData[, !(names(finalData) %in% c("album_name", "track_name", "id"))]
+
+#handling categorical variables
+finalData$explicit <- as.numeric(finalData$explicit == "TRUE")
+
+# Convert "track_genre" variable to numeric
+finalData$track_genre <- as.factor(finalData$track_genre)
+
+#Generate Prdictions
+optimalRFModel <- randomForest(popularity ~ ., data = train_data, mtry = optimal_mtry, ntree = optimal_ntree)
+popularity <- predict(optimalRFModel,newdata=finalData)
+
+
+finalData <- as.data.frame(id)
+finalData <-cbind(finalData, popularity)
+#View(finalData)
+# Export finalData to a CSV file
+write.csv(finalData, file = "testing_predictions_DeMarco_Thomas_TJD83.csv", row.names = FALSE)
+
+
+
+```
+
